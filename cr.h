@@ -55,7 +55,7 @@ While the guest (real application), would be like:
 
 ```c
 CR_EXPORT int cr_main(struct cr_plugin *ctx, enum cr_op operation) {
-    assert(ctx);
+    CR_ASSERT(ctx);
     switch (operation) {
         case CR_LOAD:   return on_load(...);
         case CR_UNLOAD: return on_unload(...);
@@ -343,12 +343,16 @@ platform should be supported."
 #define CR_IMPORT
 #endif // defined(__GNUC__)
 
-#if defined(CR_DEBUG)
-#define CR_TRACE    fprintf(stdout, "CR_TRACE: %s\n", __FUNCTION__);
-#define CR_LOG(...) fprintf(stdout, __VA_ARGS__);
+#ifndef CR_LOG
+#   define CR_LOG(...) fprintf(stdout, __VA_ARGS__);
 #else
-#define CR_TRACE
-#define CR_LOG(...)
+#   define CR_LOG(...) 
+#endif
+
+#if defined(CR_DEBUG) && !defined(CR_TRACE)
+#   define CR_TRACE    fprintf(stdout, "CR_TRACE: %s\n", __FUNCTION__);
+#else
+#   define CR_TRACE
 #endif
 
 // cr_mode defines how much we validate global state transfer between
@@ -392,7 +396,9 @@ enum cr_failure {
 
 struct cr_plugin;
 
-typedef int (*cr_plugin_main_func)(struct cr_plugin *ctx, enum cr_op operation);
+typedef int  (*cr_plugin_main_func)(struct cr_plugin *ctx, enum cr_op operation);
+typedef void (*cr_plugin_event_func)(const void* e);
+typedef void (*cr_plugin_crash_func)(struct cr_plugin *ctx, const char* file);
 
 // public interface for the plugin context, this has some user facing
 // variables that may be used to manage reload feedback.
@@ -427,9 +433,37 @@ struct cr_plugin {
 
 #else // #ifndef CR_HOST
 
-#if defined(_MSC_VER)
-// we should probably push and pop this
-#pragma warning(disable:4003) // not enough actual parameters for macro 'identifier'
+#ifndef CR_MAIN_FUNC
+#   define CR_MAIN_FUNC "cr_main"
+#endif
+
+#ifndef CR_EVENT_FUNC
+#   define CR_EVENT_FUNC "cr_events"
+#endif
+
+#ifndef CR_ASSERT
+#   include <cassert>
+#   define CR_ASSERT(e)             assert(e)
+#endif
+
+#ifndef CR_REALLOC
+#   define CR_REALLOC(ptr, size)   realloc(ptr, size)
+#endif
+
+#ifndef CR_FREE
+#   define CR_FREE(ptr)            free(ptr)
+#endif
+
+#ifndef CR_MALLOC
+#   define CR_MALLOC(size)         malloc(size)
+#endif
+
+#ifndef CR_UTF8_PATHS
+#   define CR_UTF8_PATHS           0
+#endif
+
+#ifdef _MSC_VER
+#   pragma warning(disable:4003) // macro args
 #endif
 
 #define CR_DO_EXPAND(x) x##1337
@@ -442,7 +476,6 @@ struct cr_plugin {
 #endif
 
 #include <algorithm>
-#include <cassert> // assert
 #include <chrono>  // duration for sleep
 #include <string>
 #include <thread> // this_thread::sleep_for
@@ -519,10 +552,15 @@ struct cr_internal {
     time_t timestamp = {};
     void *handle = nullptr;
     cr_plugin_main_func main = nullptr;
+    cr_plugin_event_func event_fn = nullptr;
+    cr_plugin_crash_func crash_fn = nullptr;
     cr_plugin_segment seg = {};
     cr_plugin_section data[cr_plugin_section_type::count]
                           [cr_plugin_section_version::count] = {};
     cr_mode mode = CR_SAFEST;
+    float update_tm = 0;
+    float update_interval = 0;
+    bool manual_reload = false;
 };
 
 static bool cr_plugin_section_validate(cr_plugin &ctx,
@@ -533,11 +571,11 @@ static void cr_plugin_sections_reload(cr_plugin &ctx,
                                       cr_plugin_section_version::e version);
 static void cr_plugin_sections_store(cr_plugin &ctx);
 static void cr_plugin_sections_backup(cr_plugin &ctx);
-static void cr_plugin_reload(cr_plugin &ctx);
 static void cr_plugin_unload(cr_plugin &ctx, bool rollback, bool close);
 static bool cr_plugin_changed(cr_plugin &ctx);
 static bool cr_plugin_rollback(cr_plugin &ctx);
 static int cr_plugin_main(cr_plugin &ctx, cr_op operation);
+static void cr_plugin_event_call(cr_plugin &ctx, const void* e);
 
 #if defined(CR_WINDOWS)
 
@@ -550,6 +588,7 @@ static int cr_plugin_main(cr_plugin &ctx, cr_op operation);
 
 using so_handle = HMODULE;
 
+#if CR_UTF8_PATHS
 static std::wstring cr_utf8_to_wstring(const std::string &str) {
     int wlen = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, 0, 0);
     wchar_t wpath_small[MAX_PATH];
@@ -609,6 +648,52 @@ static void cr_copy(const std::string &from, const std::string &to) {
     std::wstring wto = cr_utf8_to_wstring(to);
     CopyFileW(wfrom.c_str(), wto.c_str(), false);
 }
+
+static void cr_del(const std::string& path)
+{   
+    std::wstring wpath = cr_utf8_to_wstring(path);
+    DeleteFileW(wpath.c_str());
+}
+#else
+static size_t file_size(const std::string &path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fad)) {
+        return -1;
+    }
+
+    LARGE_INTEGER size;
+    size.HighPart = fad.nFileSizeHigh;
+    size.LowPart = fad.nFileSizeLow;
+
+    return static_cast<size_t>(size.QuadPart);
+}
+
+static time_t cr_last_write_time(const std::string &path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fad)) {
+        return -1;
+    }
+
+    LARGE_INTEGER time;
+    time.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+    time.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+
+    return static_cast<time_t>(time.QuadPart / 10000000 - 11644473600LL);
+}
+
+static bool cr_exists(const std::string &path) {
+    return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+static void cr_copy(const std::string &from, const std::string &to) {
+    CopyFileA(from.c_str(), to.c_str(), false);
+}
+
+static void cr_del(const std::string& path)
+{
+    DeleteFileA(path.c_str());
+}
+#endif
 
 // If using Microsoft Visual C/C++ compiler we need to do some workaround the
 // fact that the compiled binary has a fullpath to the PDB hardcoded inside
@@ -700,7 +785,7 @@ static bool cr_pe_fileoffset_rva(PIMAGE_NT_HEADERS ntHeaders, DWORD rva,
 }
 
 static char *cr_pdb_find(LPBYTE imageBase, PIMAGE_DEBUG_DIRECTORY debugDir) {
-    assert(debugDir && imageBase);
+    CR_ASSERT(debugDir && imageBase);
     LPBYTE debugInfo = imageBase + debugDir->PointerToRawData;
     const auto debugInfoSize = debugDir->SizeOfData;
     if (debugInfo == 0 || debugInfoSize == 0) {
@@ -737,7 +822,7 @@ static char *cr_pdb_find(LPBYTE imageBase, PIMAGE_DEBUG_DIRECTORY debugDir) {
 static bool cr_pdb_replace(const std::string &filename,
                            const std::string &pdbname, char *pdbnamebuf,
                            int pdbnamelen) {
-    assert(pdbnamebuf);
+    CR_ASSERT(pdbnamebuf);
     HANDLE fp = nullptr;
     HANDLE filemap = nullptr;
     LPVOID mem = 0;
@@ -875,7 +960,7 @@ bool static cr_pdb_process(const std::string &filename,
     char orig_pdb[MAX_PATH];
     memset(orig_pdb, 0, sizeof(orig_pdb));
     bool result = cr_pdb_replace(filename, pdbname, orig_pdb, sizeof(orig_pdb));
-    result &= static_cast<bool>(CopyFile(orig_pdb, pdbname.c_str(), 0));
+    result &= (CopyFile(orig_pdb, pdbname.c_str(), 0) ? true : false);
     return result;
 }
 #endif // _MSC_VER
@@ -890,7 +975,7 @@ static void cr_pe_section_save(cr_plugin &ctx, cr_plugin_section_type::e type,
     data->base = base;
     data->ptr = (char *)vaddr;
     data->size = shdr.SizeOfRawData;
-    data->data = realloc(data->data, shdr.SizeOfRawData);
+    data->data = CR_REALLOC(data->data, shdr.SizeOfRawData);
     if (old_size < shdr.SizeOfRawData) {
         memset((char *)data->data + old_size, '\0',
                shdr.SizeOfRawData - old_size);
@@ -901,7 +986,7 @@ static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
                                         const std::string &imagefile,
                                         bool rollback) {
     (void)imagefile;
-    assert(handle);
+    CR_ASSERT(handle);
     auto p = (cr_internal *)ctx.p;
     if (p->mode == CR_DISABLE) {
         return true;
@@ -944,7 +1029,7 @@ static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
 
 static void cr_so_unload(cr_plugin &ctx) {
     auto p = (cr_internal *)ctx.p;
-    assert(p->handle);
+    CR_ASSERT(p->handle);
     FreeLibrary((HMODULE)p->handle);
 }
 
@@ -956,14 +1041,14 @@ static so_handle cr_so_load(cr_plugin &ctx, const std::string &filename) {
     return new_dll;
 }
 
-static cr_plugin_main_func cr_so_symbol(so_handle handle) {
-    assert(handle);
-    auto new_main = (cr_plugin_main_func)GetProcAddress(handle, "cr_main");
-    if (!new_main) {
+static void* cr_so_symbol(so_handle handle, const char* name) {
+    CR_ASSERT(handle);
+    void* sym = GetProcAddress(handle, name);
+    if (!sym) {
         fprintf(stderr, "Couldn't find plugin entry point: %d\n",
                 GetLastError());
     }
-    return new_main;
+    return sym;
 }
 
 static void cr_plat_init() {
@@ -974,22 +1059,29 @@ static int cr_seh_filter(cr_plugin &ctx, unsigned long seh) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    auto p = (cr_internal *)ctx.p;
     ctx.version = ctx.version > 1 ? ctx.version - 1 : 1;
+
     switch (seh) {
     case EXCEPTION_ACCESS_VIOLATION:
         ctx.failure = CR_SEGFAULT;
+        if (p->crash_fn)    p->crash_fn(&ctx, p->fullname.c_str());
         return EXCEPTION_EXECUTE_HANDLER;
     case EXCEPTION_ILLEGAL_INSTRUCTION:
         ctx.failure = CR_ILLEGAL;
+        if (p->crash_fn)    p->crash_fn(&ctx, p->fullname.c_str());
         return EXCEPTION_EXECUTE_HANDLER;
     case EXCEPTION_DATATYPE_MISALIGNMENT:
         ctx.failure = CR_MISALIGN;
+        if (p->crash_fn)    p->crash_fn(&ctx, p->fullname.c_str());
         return EXCEPTION_EXECUTE_HANDLER;
     case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
         ctx.failure = CR_BOUNDS;
+        if (p->crash_fn)    p->crash_fn(&ctx, p->fullname.c_str());
         return EXCEPTION_EXECUTE_HANDLER;
     case EXCEPTION_STACK_OVERFLOW:
         ctx.failure = CR_STACKOVERFLOW;
+        if (p->crash_fn)    p->crash_fn(&ctx, p->fullname.c_str());
         return EXCEPTION_EXECUTE_HANDLER;
     default:
         break;
@@ -1013,7 +1105,23 @@ static int cr_plugin_main(cr_plugin &ctx, cr_op operation) {
     return -1;
 }
 
-#endif // CR_WINDOWS
+static void cr_plugin_event_call(cr_plugin &ctx, const void* e)
+{
+    auto p = (cr_internal *)ctx.p;
+#ifndef __MINGW32__
+    __try {
+#endif
+        if (p->event_fn) {
+            p->event_fn(e);
+        }
+#ifndef __MINGW32__
+    } __except (cr_seh_filter(ctx, GetExceptionCode())) {
+        return;
+    }
+#endif    
+}
+
+#endif // _WIN32
 
 #if defined(CR_LINUX) || defined(CR_OSX)
 
@@ -1074,6 +1182,11 @@ static void cr_copy(const std::string &from, const std::string &to) {
     fclose(destination);
 }
 
+static void cr_del(const std::string& path)
+{
+    unlink(path.c_str());
+}
+
 // unix,internal
 // a helper function to validate that an area of memory is empty
 // this is used to validate that the data in the .bss haven't changed
@@ -1111,7 +1224,7 @@ void cr_elf_section_save(cr_plugin &ctx, cr_plugin_section_type::e type,
     data->base = base;
     data->ptr = (char *)vaddr;
     data->size = shdr.sh_size;
-    data->data = realloc(data->data, shdr.sh_size);
+    data->data = CR_REALLOC(data->data, shdr.sh_size);
     if (old_size < shdr.sh_size) {
         memset((char *)data->data + old_size, '\0', shdr.sh_size - old_size);
     }
@@ -1126,7 +1239,7 @@ void cr_elf_section_save(cr_plugin &ctx, cr_plugin_section_type::e type,
 template <class H>
 bool cr_elf_validate_sections(cr_plugin &ctx, bool rollback, H shdr, int shnum,
                               const char *sh_strtab_p) {
-    assert(sh_strtab_p);
+    CR_ASSERT(sh_strtab_p);
     auto p = (cr_internal *)ctx.p;
     bool result = true;
     for (int i = 0; i < shnum; ++i) {
@@ -1189,7 +1302,7 @@ struct cr_ld_data {
 // https://eli.thegreenplace.net/2011/08/25/load-time-relocation-of-shared-libraries/
 static int cr_dl_header_handler(struct dl_phdr_info *info, size_t size,
                                 void *data) {
-    assert(info && data);
+    CR_ASSERT(info && data);
     auto p = (cr_ld_data *)data;
     auto ctx = p->ctx;
     if (strcasecmp(info->dlpi_name, p->fullname)) {
@@ -1219,7 +1332,7 @@ static int cr_dl_header_handler(struct dl_phdr_info *info, size_t size,
 static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
                                         const std::string &imagefile,
                                         bool rollback) {
-    assert(handle);
+    CR_ASSERT(handle);
     cr_ld_data data;
     data.ctx = &ctx;
     auto pimpl = (cr_internal *)ctx.p;
@@ -1372,9 +1485,9 @@ static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
 #endif
 
 static void cr_so_unload(cr_plugin &ctx) {
-    assert(ctx.p);
+    CR_ASSERT(ctx.p);
     auto p = (cr_internal *)ctx.p;
-    assert(p->handle);
+    CR_ASSERT(p->handle);
 
     const int r = dlclose(p->handle);
     if (r) {
@@ -1394,14 +1507,14 @@ static so_handle cr_so_load(cr_plugin &ctx, const std::string &new_file) {
     return new_dll;
 }
 
-static cr_plugin_main_func cr_so_symbol(so_handle handle) {
-    assert(handle);
+static void* cr_so_symbol(so_handle handle, const char* name) {
+    CR_ASSERT(handle);
     dlerror();
-    auto new_main = (cr_plugin_main_func)dlsym(handle, "cr_main");
-    if (!new_main) {
+    auto sym = dlsym(handle, name);
+    if (!sym) {
         fprintf(stderr, "Couldn't find plugin entry point: %s\n", dlerror());
     }
-    return new_main;
+    return sym;
 }
 
 sigjmp_buf env;
@@ -1409,7 +1522,7 @@ sigjmp_buf env;
 static void cr_signal_handler(int sig, siginfo_t *si, void *uap) {
     CR_TRACE
     (void)uap;
-    assert(si);
+    CR_ASSERT(si);
     siglongjmp(env, sig);
 }
 
@@ -1458,10 +1571,15 @@ static int cr_plugin_main(cr_plugin &ctx, cr_op operation) {
         ctx.version = ctx.version > 0 ? ctx.version - 1 : 0;
         ctx.failure = cr_signal_to_failure(sig);
         CR_LOG("1 FAILURE: %d (CR: %d)\n", sig, ctx.failure);
+
+        auto p = (cr_internal *)ctx.p;
+        if (ctx.failure != CR_NONE && p->crash_fn)    
+            p->crash_fn(&ctx, p->fullname.c_str());
+
         return -1;
     } else {
         auto p = (cr_internal *)ctx.p;
-        assert(p);
+        CR_ASSERT(p);
         if (p->main) {
             return p->main(&ctx, operation);
         }
@@ -1470,7 +1588,19 @@ static int cr_plugin_main(cr_plugin &ctx, cr_op operation) {
     return -1;
 }
 
-#endif // CR_LINUX || CR_OSX
+static void cr_plugin_event_call(cr_plugin& ctx, const void* e) {
+    if (sigsetjmp(env, 0)) {
+        ctx.failure = cr_signal_to_failure(cr_signal);
+        cr_signal = 0;
+    } else {
+        auto p = (cr_internal *)ctx.p;
+        CR_ASSERT(p);
+        if (p->event_fn) {
+            p->event_fn(e);
+        }
+    }
+}
+#endif // __unix__
 
 static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
     CR_TRACE
@@ -1480,7 +1610,7 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
         const auto new_file = cr_version_path(file, ctx.version);
 
         const bool close = false;
-        CR_LOG("unload with rollback: %d\n", rollback);
+        CR_LOG("unload '%s' with rollback: %d", file.c_str(), rollback);
         cr_plugin_unload(ctx, rollback, close);
         if (!rollback) {
             cr_copy(file, new_file);
@@ -1489,8 +1619,7 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
             auto new_pdb = cr_replace_extension(new_file, ".pdb");
 
             if (!cr_pdb_process(new_file, new_pdb)) {
-                fprintf(stderr, "Couldn't process PDB, debugging may be "
-                                "affected and/or reload may fail\n");
+                CR_LOG("Couldn't process PDB, debugging may be affected and/or reload may fail");
             }
 #endif // defined(_MSC_VER)
         }
@@ -1503,7 +1632,7 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
             // to the disk, so for now we just sleep a bit, but ideally we
             // may want to report this to the user to deal with it.
             ctx.failure = CR_BAD_IMAGE;
-            CR_LOG("waiting...\n");
+            CR_LOG("waiting...");
             return false;
         }
 
@@ -1517,21 +1646,24 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
             cr_plugin_sections_reload(ctx, cr_plugin_section_version::current);
         }
 
-        auto new_main = cr_so_symbol(new_dll);
+        auto new_main = (cr_plugin_main_func)cr_so_symbol(new_dll, CR_MAIN_FUNC);
         if (!new_main) {
             return false;
         }
-
+        
         auto p = (cr_internal *)ctx.p;
         p->handle = new_dll;
         p->main = new_main;
         if (ctx.failure != CR_BAD_IMAGE) {
             p->timestamp = cr_last_write_time(file);
         }
+        p->event_fn = (cr_plugin_event_func)cr_so_symbol(new_dll, CR_EVENT_FUNC);
+        p->update_tm = 0;
+
         ctx.version++;
-        CR_LOG("1 LOADED VERSION: %d\n", ctx.version);
+        CR_LOG("loaded: %s (version: %d)", new_file.c_str(), ctx.version);
     } else {
-        fprintf(stderr, "Error loading plugin.\n");
+        CR_LOG("Error loading plugin");
         return false;
     }
     return true;
@@ -1570,7 +1702,7 @@ static void cr_plugin_sections_backup(cr_plugin &ctx) {
         auto cur = &p->data[i][cr_plugin_section_version::current];
         if (cur->ptr) {
             auto bkp = &p->data[i][cr_plugin_section_version::backup];
-            bkp->data = realloc(bkp->data, cur->size);
+            bkp->data = CR_REALLOC(bkp->data, cur->size);
             bkp->ptr = cur->ptr;
             bkp->size = cur->size;
             bkp->base = cur->base;
@@ -1612,7 +1744,7 @@ static void cr_plugin_sections_store(cr_plugin &ctx) {
 // internal copy created during the unload step.
 static void cr_plugin_sections_reload(cr_plugin &ctx,
                                       cr_plugin_section_version::e version) {
-    assert(version < cr_plugin_section_version::count);
+    CR_ASSERT(version < cr_plugin_section_version::count);
     auto p = (cr_internal *)ctx.p;
     if (p->mode == CR_DISABLE) {
         return;
@@ -1642,7 +1774,7 @@ static void cr_so_sections_free(cr_plugin &ctx) {
     for (int i = 0; i < cr_plugin_section_type::count; ++i) {
         for (int v = 0; v < cr_plugin_section_version::count; ++v) {
             if (p->data[i][v].data) {
-                free(p->data[i][v].data);
+                CR_FREE(p->data[i][v].data);
             }
             p->data[i][v].data = nullptr;
         }
@@ -1699,60 +1831,85 @@ static bool cr_plugin_rollback(cr_plugin &ctx) {
 // update one time with `cr_op::CR_LOAD`. Note that this may fail due to crash
 // handling during this first update, effectivelly rollbacking if possible and
 // causing a consecutive `CR_LOAD` with the previous version.
-static void cr_plugin_reload(cr_plugin &ctx) {
-    if (cr_plugin_changed(ctx)) {
-        CR_TRACE
-        if (!cr_plugin_load_internal(ctx, false)) {
-            return;
-        }
-        int r = cr_plugin_main(ctx, CR_LOAD);
-        if (r < 0 && !ctx.failure) {
-            CR_LOG("2 FAILURE: %d\n", r);
-            ctx.failure = CR_USER;
-        }
+extern "C" int cr_plugin_reload(cr_plugin &ctx) {
+    CR_TRACE
+    cr_plugin_load_internal(ctx, false);
+    int r = cr_plugin_main(ctx, CR_LOAD);
+    if (r < 0 && ctx.failure == CR_NONE) {
+        CR_LOG("2 FAILURE: %d", r);
+        ctx.failure = CR_USER;
     }
+    return r;
 }
 
 // This is basically the plugin `main` function, should be called as
 // frequently as your core logic/application needs. -1 and -2 are the only
 // possible return values from cr meaning a fatal error (causes rollback),
 // other return values are returned directly from `cr_main`.
-extern "C" int cr_plugin_update(cr_plugin &ctx) {
-    if (ctx.failure) {
-        CR_LOG("1 ROLLBACK version was %d\n", ctx.version);
-        cr_plugin_rollback(ctx);
-        CR_LOG("1 ROLLBACK version is now %d\n", ctx.version);
+extern "C" int cr_plugin_update(cr_plugin &ctx, float dt) {
+    auto p = (cr_internal *)ctx.p;
+    if (ctx.failure == CR_NONE) {
+        if (!p->manual_reload) {
+            // Use update interval for checking file properties
+            p->update_tm += dt;
+            if (p->update_tm >= p->update_interval && cr_plugin_changed(ctx)) { 
+                cr_plugin_reload(ctx);
+                p->update_tm = 0;
+            }
+        }
     } else {
-        cr_plugin_reload(ctx);
+        CR_LOG("1 ROLLBACK version was %d", ctx.version);
+        cr_plugin_rollback(ctx);
+        CR_LOG("1 ROLLBACK version is now %d", ctx.version);
     }
 
     // -2 to differentiate from crash handling code path, meaning the crash
     // happened probably during load or unload and not update
     if (ctx.failure) {
-        CR_LOG("3 FAILURE: -2\n");
+        CR_LOG("3 FAILURE: -2");
         return -2;
     }
 
     int r = cr_plugin_main(ctx, CR_STEP);
     if (r < 0 && !ctx.failure) {
-        CR_LOG("4 FAILURE: CR_USER\n");
+        CR_LOG("4 FAILURE: CR_USER");
         ctx.failure = CR_USER;
     }
     return r;
 }
 
+extern "C" void cr_plugin_event(cr_plugin& ctx, const void* e) {
+    if (ctx.failure == CR_NONE)
+        cr_plugin_event_call(ctx, e);
+}
+
+extern "C" void* cr_plugin_symbol(cr_plugin& ctx, const char* name)
+{
+    if (ctx.failure == CR_NONE) {
+        auto p = (cr_internal *)ctx.p;
+        return cr_so_symbol((so_handle)p->handle, name);
+    } else {
+        return nullptr;
+    }
+}
+
 // Loads a plugin from the specified full path (or current directory if NULL).
-extern "C" bool cr_plugin_load(cr_plugin &ctx, const char *fullpath) {
-    CR_TRACE
-    assert(fullpath);
-    auto p = new cr_internal;
+extern "C" bool cr_plugin_load(cr_plugin &ctx, const char *fullpath, 
+                               float update_interval, bool manual_reload,
+                               cr_plugin_crash_func crash_fn = nullptr) {
+    CR_ASSERT(fullpath);
+    auto p = new(CR_MALLOC(sizeof(cr_internal))) cr_internal;
     p->mode = CR_OP_MODE;
     p->fullname = fullpath;
+    p->crash_fn = crash_fn;
+    p->update_interval = update_interval;
+    p->manual_reload = manual_reload;
+
     ctx.p = p;
     ctx.version = 0;
     ctx.failure = CR_NONE;
     cr_plat_init();
-    return true;
+    return cr_plugin_reload(ctx) == 0;
 }
 
 // Call to cleanup internal state once the plugin is not required anymore.
@@ -1763,7 +1920,19 @@ extern "C" void cr_plugin_close(cr_plugin &ctx) {
     cr_plugin_unload(ctx, rollback, close);
     cr_so_sections_free(ctx);
     auto p = (cr_internal *)ctx.p;
-    delete p;
+
+    // delete backups
+    const auto file = p->fullname;
+    for (unsigned int i = 0; i < ctx.version; i++) {
+        cr_del(cr_version_path(file, i));
+#if defined(_WIN32)
+        cr_del(cr_replace_extension(cr_version_path(file, i), ".pdb"));
+#endif
+    }
+
+    p->~cr_internal();
+    CR_FREE(p);
+
     ctx.p = nullptr;
     ctx.version = 0;
 }
