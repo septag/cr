@@ -344,13 +344,13 @@ platform should be supported."
 #endif // defined(__GNUC__)
 
 #ifndef CR_LOG
-#   define CR_LOG(...) fprintf(stdout, __VA_ARGS__);
-#else
-#   define CR_LOG(...) 
+#   define CR_LOG(...)     fprintf(stdout, __VA_ARGS__);
 #endif
 
-#if defined(CR_DEBUG) && !defined(CR_TRACE)
-#   define CR_TRACE    fprintf(stdout, "CR_TRACE: %s\n", __FUNCTION__);
+#if defined(CR_DEBUG)
+#   ifndef CR_TRACE
+#       define CR_TRACE    fprintf(stdout, "CR_TRACE: %s\n", __FUNCTION__);
+#   endif
 #else
 #   define CR_TRACE
 #endif
