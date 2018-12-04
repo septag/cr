@@ -131,7 +131,7 @@ Return
 
 - `true` in case of success, `false` otherwise.
 
-#### `int cr_plugin_update(cr_plugin &ctx)`
+#### `int cr_plugin_update(cr_plugin &ctx, bool reloadCheck = true)`
 
 This function will call the plugin `cr_main` function. It should be called as
  frequently as the core logic/application needs.
@@ -139,6 +139,7 @@ This function will call the plugin `cr_main` function. It should be called as
 Arguments
 
 - `ctx` the current plugin context data.
+- `reloadCheck` optional: do a disk check (stat()) to see if the dynamic library needs a reload.
 
 Return
 
@@ -477,6 +478,7 @@ struct cr_plugin {
 
 #include <algorithm>
 #include <chrono>  // duration for sleep
+#include <cstring> // memcpy
 #include <string>
 #include <thread> // this_thread::sleep_for
 
@@ -558,9 +560,6 @@ struct cr_internal {
     cr_plugin_section data[cr_plugin_section_type::count]
                           [cr_plugin_section_version::count] = {};
     cr_mode mode = CR_SAFEST;
-    float update_tm = 0;
-    float update_interval = 0;
-    bool manual_reload = false;
 };
 
 static bool cr_plugin_section_validate(cr_plugin &ctx,
@@ -1479,7 +1478,7 @@ static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
         break;
     }
 
-	return result;
+    return result;
 }
 
 #endif
@@ -1589,9 +1588,8 @@ static int cr_plugin_main(cr_plugin &ctx, cr_op operation) {
 }
 
 static void cr_plugin_event_call(cr_plugin& ctx, const void* e) {
-    if (sigsetjmp(env, 0)) {
-        ctx.failure = cr_signal_to_failure(cr_signal);
-        cr_signal = 0;
+    if (int sig = sigsetjmp(env, 1)) {
+        ctx.failure = cr_signal_to_failure(sig);
     } else {
         auto p = (cr_internal *)ctx.p;
         CR_ASSERT(p);
@@ -1650,15 +1648,14 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
         if (!new_main) {
             return false;
         }
-        
-        auto p = (cr_internal *)ctx.p;
-        p->handle = new_dll;
-        p->main = new_main;
+
+        auto p2 = (cr_internal *)ctx.p;
+        p2->handle = new_dll;
+        p2->main = new_main;
         if (ctx.failure != CR_BAD_IMAGE) {
-            p->timestamp = cr_last_write_time(file);
+            p2->timestamp = cr_last_write_time(file);
         }
-        p->event_fn = (cr_plugin_event_func)cr_so_symbol(new_dll, CR_EVENT_FUNC);
-        p->update_tm = 0;
+        p2->event_fn = (cr_plugin_event_func)cr_so_symbol(new_dll, CR_EVENT_FUNC);
 
         ctx.version++;
         CR_LOG("loaded: %s (version: %d)", new_file.c_str(), ctx.version);
@@ -1846,21 +1843,15 @@ extern "C" int cr_plugin_reload(cr_plugin &ctx) {
 // frequently as your core logic/application needs. -1 and -2 are the only
 // possible return values from cr meaning a fatal error (causes rollback),
 // other return values are returned directly from `cr_main`.
-extern "C" int cr_plugin_update(cr_plugin &ctx, float dt) {
-    auto p = (cr_internal *)ctx.p;
-    if (ctx.failure == CR_NONE) {
-        if (!p->manual_reload) {
-            // Use update interval for checking file properties
-            p->update_tm += dt;
-            if (p->update_tm >= p->update_interval && cr_plugin_changed(ctx)) { 
-                cr_plugin_reload(ctx);
-                p->update_tm = 0;
-            }
-        }
-    } else {
-        CR_LOG("1 ROLLBACK version was %d", ctx.version);
+extern "C" int cr_plugin_update(cr_plugin &ctx, bool reloadCheck = true) {
+    if (ctx.failure) {
+        CR_LOG("1 ROLLBACK version was %d\n", ctx.version);
         cr_plugin_rollback(ctx);
-        CR_LOG("1 ROLLBACK version is now %d", ctx.version);
+        CR_LOG("1 ROLLBACK version is now %d\n", ctx.version);
+    } else {
+        if (reloadCheck && cr_plugin_changed(ctx)) {
+            cr_plugin_reload(ctx);
+        }
     }
 
     // -2 to differentiate from crash handling code path, meaning the crash
@@ -1895,15 +1886,12 @@ extern "C" void* cr_plugin_symbol(cr_plugin& ctx, const char* name)
 
 // Loads a plugin from the specified full path (or current directory if NULL).
 extern "C" bool cr_plugin_load(cr_plugin &ctx, const char *fullpath, 
-                               float update_interval, bool manual_reload,
                                cr_plugin_crash_func crash_fn = nullptr) {
     CR_ASSERT(fullpath);
     auto p = new(CR_MALLOC(sizeof(cr_internal))) cr_internal;
     p->mode = CR_OP_MODE;
     p->fullname = fullpath;
     p->crash_fn = crash_fn;
-    p->update_interval = update_interval;
-    p->manual_reload = manual_reload;
 
     ctx.p = p;
     ctx.version = 0;
