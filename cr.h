@@ -625,6 +625,20 @@ static std::wstring cr_utf8_to_wstring(const std::string &str) {
     return wpath;
 }
 
+static size_t file_size(const std::string &path) {
+    std::wstring wpath = cr_utf8_to_wstring(path);
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard, &fad)) {
+        return -1;
+    }
+
+    LARGE_INTEGER size;
+    size.HighPart = fad.nFileSizeHigh;
+    size.LowPart = fad.nFileSizeLow;
+
+    return static_cast<size_t>(size.QuadPart);
+}
+
 static time_t cr_last_write_time(const std::string &path) {
     std::wstring wpath = cr_utf8_to_wstring(path);
     WIN32_FILE_ATTRIBUTE_DATA fad;
