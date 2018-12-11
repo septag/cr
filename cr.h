@@ -8,7 +8,7 @@ A single file header-only live reload solution for C, written in C++:
 - automatic crash protection;
 - automatic static state transfer;
 - based on dynamic reloadable binary (.so/.dylib/.dll);
-- support multiple plugins[1];
+- support multiple plugins;
 - MIT licensed;
 
 ### Build Status:
@@ -226,6 +226,19 @@ Usage
 
 `static bool CR_STATE bInitialized = false;`
 
+#### Overridable macros
+
+You can define these macros before including cr.h in host (CR_HOST) to customize cr.h
+ memory allocations and other behaviours:
+
+- `CR_MAIN_FUNC`: changes 'cr_main' symbol to user-defined function name. default: #define CR_MAIN_FUNC "cr_main"
+- `CR_ASSERT`: override assert. default: #define CA_ASSERT(e) assert(e)
+- `CR_REALLOC`: override libc's realloc. default: #define CR_REALLOC(ptr, size) ::realloc(ptr, size)
+- `CR_MALLOC`: override libc's malloc. default: #define CR_MALLOC(size) ::malloc(size)
+- `CR_FREE`: override libc's free. default: #define CR_FREE(ptr) ::free(ptr)
+- `CR_DEBUG`: outputs debug messages in CR_LOG and CR_TRACE 
+- `CR_LOG`: logs debug messages. default (CR_DEBUG only): #define CR_LOG(...) fprintf(stdout, __VA_ARGS__)
+- `CR_TRACE`: prints function calls. default (CR_DEBUG only): #define CR_TRACE(...) fprintf(stdout, "CR_TRACE: %s\n", __FUNCTION__)
 
 ### FAQ / Troubleshooting
 
@@ -267,6 +280,26 @@ With all these information you'll be able to decide which is better to your use 
 
 #### [MESH Consultants Inc.](http://meshconsultants.ca/)
 **For sponsoring the port of `cr` to the MacOSX.**
+
+### Contributors
+
+[Danny Grein](https://github.com/fungos)
+
+[Rokas Kupstys](https://github.com/rokups)
+
+[Noah Rinehart](https://github.com/noahrinehart)
+
+[Niklas Lundberg](https://github.com/datgame)
+
+[Sepehr Taghdisian](https://github.com/septag)
+
+### Contributing
+
+We welcome *ALL* contributions, there is no minor things to contribute with, even one letter typo fixes are welcome.
+
+The only things we require is to test thoroughly, maintain code style and keeping documentation up-to-date.
+
+Also, accepting and agreeing to release any contribution under the same license.
 
 ----
 
@@ -343,18 +376,6 @@ platform should be supported."
 #endif
 #define CR_IMPORT
 #endif // defined(__GNUC__)
-
-#ifndef CR_LOG
-#   define CR_LOG(...)     fprintf(stdout, __VA_ARGS__);
-#endif
-
-#if defined(CR_DEBUG)
-#   ifndef CR_TRACE
-#       define CR_TRACE    fprintf(stdout, "CR_TRACE: %s\n", __FUNCTION__);
-#   endif
-#else
-#   define CR_TRACE
-#endif
 
 // cr_mode defines how much we validate global state transfer between
 // instances. The default is CR_UNSAFE, you can choose another mode by
@@ -434,6 +455,25 @@ struct cr_plugin {
 
 #else // #ifndef CR_HOST
 
+// Overridable macros
+#ifndef CR_LOG
+#   ifdef CR_DEBUG
+#       include <stdio.h>
+#       define CR_LOG(...)     fprintf(stdout, __VA_ARGS__)
+#   else
+#       define CR_LOG(...)     
+#   endif
+#endif
+
+#ifndef CR_TRACE
+#   ifdef CR_DEBUG
+#       include <stdio.h>
+#       define CR_TRACE        fprintf(stdout, "CR_TRACE: %s\n", __FUNCTION__);
+#   else
+#       define CR_TRACE     
+#   endif
+#endif
+
 #ifndef CR_MAIN_FUNC
 #   define CR_MAIN_FUNC "cr_main"
 #endif
@@ -443,28 +483,32 @@ struct cr_plugin {
 #endif
 
 #ifndef CR_ASSERT
-#   include <cassert>
+#   include <assert.h>
 #   define CR_ASSERT(e)             assert(e)
 #endif
 
 #ifndef CR_REALLOC
-#   define CR_REALLOC(ptr, size)   realloc(ptr, size)
+#   include <stdlib.h>
+#   define CR_REALLOC(ptr, size)   ::realloc(ptr, size)
 #endif
 
 #ifndef CR_FREE
-#   define CR_FREE(ptr)            free(ptr)
+#   include <stdlib.h>
+#   define CR_FREE(ptr)            ::free(ptr)
 #endif
 
 #ifndef CR_MALLOC
-#   define CR_MALLOC(size)         malloc(size)
+#   include <stdlib.h>
+#   define CR_MALLOC(size)         ::malloc(size)
 #endif
 
 #ifndef CR_UTF8_PATHS
 #   define CR_UTF8_PATHS           0
 #endif
 
-#ifdef _MSC_VER
-#   pragma warning(disable:4003) // macro args
+#if defined(_MSC_VER)
+// we should probably push and pop this
+#   pragma warning(disable:4003) // not enough actual parameters for macro 'identifier'
 #endif
 
 #define CR_DO_EXPAND(x) x##1337
@@ -1032,7 +1076,7 @@ static void cr_so_unload(cr_plugin &ctx) {
     FreeLibrary((HMODULE)p->handle);
 }
 
-static so_handle cr_so_load(cr_plugin &ctx, const std::string &filename) {
+static so_handle cr_so_load(const std::string &filename) {
     auto new_dll = LoadLibrary(filename.c_str());
     if (!new_dll) {
         fprintf(stderr, "Couldn't load plugin: %d\n", GetLastError());
@@ -1389,6 +1433,8 @@ static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
+#include <stdlib.h>     // realpath
+#include <limits.h>     // PATH_MAX
 
 #if __LP64__
 typedef struct mach_header_64 macho_hdr;
@@ -1411,7 +1457,7 @@ void cr_macho_section_save(cr_plugin &ctx, cr_plugin_section_type::e type,
     data->base = 0;
     data->ptr = (char *)addr;
     data->size = size;
-    data->data = realloc(data->data, size);
+    data->data = CR_REALLOC(data->data, size);
     if (old_size < size) {
         memset((char *)data->data + old_size, '\0', size - old_size);
     }
@@ -1434,10 +1480,18 @@ static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
     }
     CR_TRACE
 
+    // resolve absolute path of the image, because _dyld_get_image_name returns abs path
+    char imageAbsPath[PATH_MAX+1];
+    if (!::realpath(imagefile.c_str(), imageAbsPath)) {
+        CR_ASSERT(0 && "resolving absolute path for plugin failed");
+        return false;
+    }
+
     const int count = (int)_dyld_image_count();
     for (int i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
-        if (strcasecmp(name, imagefile.c_str())) {
+
+        if (strcasecmp(name, imageAbsPath)) {
             // match loaded image filename
             continue;
         }
@@ -1448,8 +1502,6 @@ static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
             continue;
         }
 
-        intptr_t vaddr = _dyld_get_image_vmaddr_slide(i);
-        auto cmd_stride = sizeof(struct mach_header);
         if (hdr->magic != CR_MH_MAGIC) {
             // check for conforming mach-o header
             continue;
@@ -1497,7 +1549,7 @@ static void cr_so_unload(cr_plugin &ctx) {
     p->main = nullptr;
 }
 
-static so_handle cr_so_load(cr_plugin &ctx, const std::string &new_file) {
+static so_handle cr_so_load(const std::string &new_file) {
     dlerror();
     auto new_dll = dlopen(new_file.c_str(), RTLD_NOW);
     if (!new_dll) {
@@ -1608,7 +1660,7 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
         const auto new_file = cr_version_path(file, ctx.version);
 
         const bool close = false;
-        CR_LOG("unload '%s' with rollback: %d", file.c_str(), rollback);
+        CR_LOG("unload '%s' with rollback: %d\n", file.c_str(), rollback);
         cr_plugin_unload(ctx, rollback, close);
         if (!rollback) {
             cr_copy(file, new_file);
@@ -1622,7 +1674,7 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
 #endif // defined(_MSC_VER)
         }
 
-        auto new_dll = cr_so_load(ctx, new_file);
+        auto new_dll = cr_so_load(new_file);
         if (!new_dll) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             // we may want set a failure reason and avoid sleeping ourselves.
@@ -1658,7 +1710,7 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
         p2->event_fn = (cr_plugin_event_func)cr_so_symbol(new_dll, CR_EVENT_FUNC);
 
         ctx.version++;
-        CR_LOG("loaded: %s (version: %d)", new_file.c_str(), ctx.version);
+        CR_LOG("loaded: %s (version: %d)\n", new_file.c_str(), ctx.version);
     } else {
         CR_LOG("Error loading plugin");
         return false;
