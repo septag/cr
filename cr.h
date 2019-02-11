@@ -523,10 +523,6 @@ struct cr_plugin {
 #   define CR_MALLOC(size)         ::malloc(size)
 #endif
 
-#ifndef CR_UTF8_PATHS
-#   define CR_UTF8_PATHS           0
-#endif
-
 #if defined(_MSC_VER)
 // we should probably push and pop this
 #   pragma warning(disable:4003) // not enough actual parameters for macro 'identifier'
