@@ -523,6 +523,10 @@ struct cr_plugin {
 #   define CR_MALLOC(size)         ::malloc(size)
 #endif
 
+#ifndef CR_UTF8_PATHS
+#   define CR_UTF8_PATHS           0
+#endif
+
 #if defined(_MSC_VER)
 // we should probably push and pop this
 #   pragma warning(disable:4003) // not enough actual parameters for macro 'identifier'
@@ -1506,8 +1510,6 @@ static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
             continue;
         }
 
-        intptr_t vaddr = _dyld_get_image_vmaddr_slide(i);
-        auto cmd_stride = sizeof(struct mach_header);
         if (hdr->magic != CR_MH_MAGIC) {
             // check for conforming mach-o header
             continue;
