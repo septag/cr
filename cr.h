@@ -1687,7 +1687,7 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
             // to the disk, so for now we just sleep a bit, but ideally we
             // may want to report this to the user to deal with it.
             ctx.failure = CR_BAD_IMAGE;
-            CR_LOG("waiting...");
+            CR_LOG("waiting...\n");
             return false;
         }
 
@@ -1887,10 +1887,13 @@ static bool cr_plugin_rollback(cr_plugin &ctx) {
 // causing a consecutive `CR_LOAD` with the previous version.
 extern "C" int cr_plugin_reload(cr_plugin &ctx) {
     CR_TRACE
-    cr_plugin_load_internal(ctx, false);
+    if (!cr_plugin_load_internal(ctx, false)) {
+        return -1;
+    }
+
     int r = cr_plugin_main(ctx, CR_LOAD);
     if (r < 0 && ctx.failure == CR_NONE) {
-        CR_LOG("2 FAILURE: %d", r);
+        CR_LOG("2 FAILURE: %d\n", r);
         ctx.failure = CR_USER;
     }
     return r;
@@ -1914,13 +1917,13 @@ extern "C" int cr_plugin_update(cr_plugin &ctx, bool reloadCheck = true) {
     // -2 to differentiate from crash handling code path, meaning the crash
     // happened probably during load or unload and not update
     if (ctx.failure) {
-        CR_LOG("3 FAILURE: -2");
+        CR_LOG("3 FAILURE: -2\n");
         return -2;
     }
 
     int r = cr_plugin_main(ctx, CR_STEP);
     if (r < 0 && !ctx.failure) {
-        CR_LOG("4 FAILURE: CR_USER");
+        CR_LOG("4 FAILURE: CR_USER\n");
         ctx.failure = CR_USER;
     }
     return r;
