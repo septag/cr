@@ -584,10 +584,18 @@ static std::string cr_version_path(const std::string &basepath,
     std::string folder, fname, ext;
     cr_split_path(basepath, folder, fname, ext);
     std::string ver = std::to_string(version);
+#if _MSC_VER
+    // When patching PDB file path in library file we will drop path and leave only file name.
+    // Length of path is extra space for version number. Trim file name only if version number
+    // length exceeds pdb folder path length. This is not relevant on other platforms.
+    if (ver.size() > folder.size()) {
+        fname = fname.substr(0, fname.size() - (ver.size() - folder.size()));
+    }    
+#endif
     if (!temppath.empty()) {
         folder = temppath;
     }
-    return folder + fname.substr(0, fname.size() - ver.size()) + ver + ext;
+    return folder + fname + ver + ext;
 }
 
 namespace cr_plugin_section_type {
@@ -653,12 +661,14 @@ static void cr_set_temporary_path(cr_plugin &ctx, const std::string &path) {
 #include <windows.h>
 #include <dbghelp.h>
 // clang-format on
-
+#ifdef _MSC_VER
 #pragma comment(lib, "dbghelp.lib")
-
+#endif
 using so_handle = HMODULE;
 
-#if CR_WINDOWS_UTF8_PATHS
+#ifdef UNICODE
+#   define CR_WINDOWS_ConvertPath(_newpath, _path)     std::wstring _newpath(cr_utf8_to_wstring(_path))
+
 static std::wstring cr_utf8_to_wstring(const std::string &str) {
     int wlen = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, 0, 0);
     wchar_t wpath_small[MAX_PATH];
@@ -675,11 +685,14 @@ static std::wstring cr_utf8_to_wstring(const std::string &str) {
 
     return wpath;
 }
+#else
+#   define CR_WINDOWS_ConvertPath(_newpath, _path)     const std::string &_newpath = _path
+#endif  // UNICODE
 
 static time_t cr_last_write_time(const std::string &path) {
-    std::wstring wpath = cr_utf8_to_wstring(path);
+    CR_WINDOWS_ConvertPath(_path, path);
     WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard, &fad)) {
+    if (!GetFileAttributesEx(_path.c_str(), GetFileExInfoStandard, &fad)) {
         return -1;
     }
 
@@ -695,19 +708,19 @@ static time_t cr_last_write_time(const std::string &path) {
 }
 
 static bool cr_exists(const std::string &path) {
-    std::wstring wpath = cr_utf8_to_wstring(path);
-    return GetFileAttributesW(wpath.c_str()) != INVALID_FILE_ATTRIBUTES;
+    CR_WINDOWS_ConvertPath(_path, path);
+    return GetFileAttributes(_path.c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
 static bool cr_copy(const std::string &from, const std::string &to) {
-    std::wstring wfrom = cr_utf8_to_wstring(from);
-    std::wstring wto = cr_utf8_to_wstring(to);
-    return CopyFileW(wfrom.c_str(), wto.c_str(), false) != false;
+    CR_WINDOWS_ConvertPath(_from, from);
+    CR_WINDOWS_ConvertPath(_to, to);
+    return CopyFile(_from.c_str(), _to.c_str(), FALSE) ? true : false;
 }
 
 static void cr_del(const std::string& path) {   
-    std::wstring wpath = cr_utf8_to_wstring(path);
-    DeleteFileW(wpath.c_str());
+    CR_WINDOWS_ConvertPath(_path, path);
+    DeleteFile(_path.c_str());
 }
 #else
 static time_t cr_last_write_time(const std::string &path) {
@@ -860,16 +873,16 @@ static char *cr_pdb_find(LPBYTE imageBase, PIMAGE_DEBUG_DIRECTORY debugDir) {
     return nullptr;
 }
 
-static bool cr_pdb_replace(const std::string &filename,
-                           const std::string &pdbname, char *pdbnamebuf,
-                           int pdbnamelen) {
-    CR_ASSERT(pdbnamebuf);
+static bool cr_pdb_replace(const std::string &filename, const std::string &pdbname,
+                           std::string &orig_pdb) {
+    CR_WINDOWS_ConvertPath(_filename, filename);
+
     HANDLE fp = nullptr;
     HANDLE filemap = nullptr;
     LPVOID mem = 0;
     bool result = false;
     do {
-        fp = CreateFile(filename.c_str(), GENERIC_READ | GENERIC_WRITE,
+        fp = CreateFile(_filename.c_str(), GENERIC_READ | GENERIC_WRITE,
                         FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                         FILE_ATTRIBUTE_NORMAL, nullptr);
         if ((fp == INVALID_HANDLE_VALUE) || (fp == nullptr)) {
@@ -971,12 +984,13 @@ static bool cr_pdb_replace(const std::string &filename,
 
         for (int i = 1; i <= numEntries; i++, debugDir++) {
             char *pdb = cr_pdb_find((LPBYTE)mem, debugDir);
-            if (pdb && strlen(pdb) >= strlen(pdbname.c_str())) {
+            if (pdb) {
                 auto len = strlen(pdb);
-                memcpy_s(pdbnamebuf, pdbnamelen, pdb, len);
-                std::memset(pdb, '\0', len);
-                memcpy_s(pdb, len, pdbname.c_str(), pdbname.length());
-                result = true;
+                if (len >= strlen(pdbname.c_str())) {
+                    orig_pdb = pdb;
+                    memcpy_s(pdb, len, pdbname.c_str(), pdbname.length());
+                    result = true;
+                }
             }
         }
     } while (0);
@@ -996,12 +1010,12 @@ static bool cr_pdb_replace(const std::string &filename,
     return result;
 }
 
-bool static cr_pdb_process(const std::string &filename,
-                           const std::string &pdbname) {
-    char orig_pdb[MAX_PATH];
-    memset(orig_pdb, 0, sizeof(orig_pdb));
-    bool result = cr_pdb_replace(filename, pdbname, orig_pdb, sizeof(orig_pdb));
-    result &= static_cast<bool>(CopyFile(orig_pdb, pdbname.c_str(), 0));
+bool static cr_pdb_process(const std::string &source,
+                           const std::string &desination) {
+    std::string folder, fname, ext, orig_pdb;
+    cr_split_path(desination, folder, fname, ext);
+    bool result = cr_pdb_replace(desination, fname + ".pdb", orig_pdb);
+    result &= cr_copy(orig_pdb, cr_replace_extension(desination, ".pdb"));
     return result;
 }
 #endif // _MSC_VER
@@ -1075,7 +1089,8 @@ static void cr_so_unload(cr_plugin &ctx) {
 }
 
 static so_handle cr_so_load(const std::string &filename) {
-    auto new_dll = LoadLibrary(filename.c_str());
+    CR_WINDOWS_ConvertPath(_filename, filename);
+    auto new_dll = LoadLibrary(_filename.c_str());
     if (!new_dll) {
         CR_ERROR("Couldn't load plugin: %d\n", GetLastError());
     }
@@ -1153,6 +1168,12 @@ static int cr_plugin_main(cr_plugin &ctx, cr_op operation) {
 #include <sys/ucontext.h>
 #include <unistd.h>
 
+#if defined(CR_LINUX)
+#   include <sys/sendfile.h>    // sendfile
+#elif defined(CR_OSX)
+#   include <copyfile.h>        // copyfile
+#endif
+
 using so_handle = void *;
 
 static size_t cr_file_size(const std::string &path) {
@@ -1186,26 +1207,27 @@ static bool cr_exists(const std::string &path) {
 }
 
 static bool cr_copy(const std::string &from, const std::string &to) {
-    char buffer[BUFSIZ];
-    size_t size;
-
-    FILE *source = fopen(from.c_str(), "rb");
-    if (source == nullptr) {
+#if defined(CR_LINUX)
+    // Reference: http://www.informit.com/articles/article.aspx?p=23618&seqNum=13
+    int input, output;
+    struct stat src_stat;
+    if ((input = open(from.c_str(), O_RDONLY)) == -1) {
         return false;
     }
-    FILE *destination = fopen(to.c_str(), "wb");
-    if (destination == nullptr) {
-        fclose(source);
+    fstat(input, &src_stat);
+
+    if ((output = open(to.c_str(), O_WRONLY|O_CREAT, O_NOFOLLOW|src_stat.st_mode)) == -1) {
+        close(input);
         return false;
     }
 
-    while ((size = fread(buffer, 1, BUFSIZ, source)) != 0) {
-        fwrite(buffer, 1, size, destination);
-    }
-
-    fclose(source);
-    fclose(destination);
-    return true;
+    int result = sendfile(output, input, NULL, src_stat.st_size);
+    close(input);
+    close(output);
+    return result > -1;
+#elif defined(CR_OSX)
+    return copyfile(from.c_str(), to.c_str(), NULL, COPYFILE_ALL|COPYFILE_NOFOLLOW_DST) == 0;
+#endif
 }
 
 static void cr_del(const std::string& path) {
@@ -1634,11 +1656,9 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
             cr_copy(file, new_file);
 
 #if defined(_MSC_VER)
-            auto new_pdb = cr_replace_extension(new_file, ".pdb");
-
-            if (!cr_pdb_process(new_file, new_pdb)) {
+            if (!cr_pdb_process(file, new_file)) {
                 CR_ERROR("Couldn't process PDB, debugging may be "
-                                "affected and/or reload may fail\n");
+                         "affected and/or reload may fail\n");
             }
 #endif // defined(_MSC_VER)
         }
@@ -1918,7 +1938,7 @@ extern "C" void cr_plugin_close(cr_plugin &ctx) {
     const auto file = p->fullname;
     for (unsigned int i = 0; i < ctx.version; i++) {
         cr_del(cr_version_path(file, i, p->temppath));
-#if defined(_WIN32)
+#if defined(_MSC_VER)
         cr_del(cr_replace_extension(cr_version_path(file, i, p->temppath), ".pdb"));
 #endif
     }
