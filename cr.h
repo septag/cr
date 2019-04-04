@@ -1078,7 +1078,7 @@ static void* cr_so_symbol(so_handle handle, const char* name) {
     CR_ASSERT(handle);
     void* sym = GetProcAddress(handle, name);
     if (!sym) {
-        CR_ERROR(stderr, "Couldn't find plugin entry point: %d\n",
+        CR_ERROR("Couldn't find plugin entry point: %d\n",
                  GetLastError());
     }
     return sym;
