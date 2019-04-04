@@ -410,6 +410,7 @@ enum cr_op {
     CR_STEP = 1,
     CR_UNLOAD = 2,
     CR_CLOSE = 3,
+    CR_INIT = 4
 };
 
 enum cr_failure {
@@ -433,6 +434,8 @@ struct cr_plugin;
 typedef int  (*cr_plugin_main_func)(struct cr_plugin *ctx, enum cr_op operation);
 typedef void (*cr_plugin_event_func)(const void* e);
 typedef void (*cr_plugin_crash_func)(struct cr_plugin *ctx, const char* file);
+typedef void (*cr_plugin_reload_func)(struct cr_plugin* ctx, const char* filename, 
+                                      const void** ptrs, const void** new_ptrs, int num_ptrs);
 
 // public interface for the plugin context, this has some user facing
 // variables that may be used to manage reload feedback.
@@ -448,20 +451,25 @@ struct cr_plugin {
     enum cr_failure failure;
 };
 
-#ifndef CR_HOST
+#if !defined(CR_HOST) && !defined(__INTELLISENSE__)
 
 // Guest specific compiler defines/customizations
 #if defined(_MSC_VER)
 #pragma section(".state", read, write)
 #define CR_STATE __declspec(allocate(".state"))
+#pragma section(".ptrs", read, write)
+#define CR_POINTER __declspec(allocate(".ptrs"))
 #endif // defined(_MSC_VER)
 
 #if defined(CR_OSX)
 #define CR_STATE __attribute__((used, section("__DATA,__state")))
+#define CR_POINTER __attribute__((used, section("__DATA,__ptrs")))
 #else
 #if defined(__GNUC__) // clang & gcc
 #pragma section(".state", read, write)
 #define CR_STATE __attribute__((section(".state")))
+#pragma section(".ptrs", read, write)
+#define CR_POINTER __attribute__((section(".ptrs")))
 #endif // defined(__GNUC__)
 #endif
 
@@ -473,7 +481,7 @@ struct cr_plugin {
 #       include <stdio.h>
 #       define CR_LOG(...)     fprintf(stdout, __VA_ARGS__)
 #   else
-#       define CR_LOG(...)     
+#       define CR_LOG(...)
 #   endif
 #endif
 
@@ -491,7 +499,7 @@ struct cr_plugin {
 #       include <stdio.h>
 #       define CR_TRACE        fprintf(stdout, "CR_TRACE: %s\n", __FUNCTION__);
 #   else
-#       define CR_TRACE     
+#       define CR_TRACE
 #   endif
 #endif
 
@@ -591,7 +599,7 @@ static std::string cr_version_path(const std::string &basepath,
     // length exceeds pdb folder path length. This is not relevant on other platforms.
     if (ver.size() > folder.size()) {
         fname = fname.substr(0, fname.size() - (ver.size() - folder.size()));
-    }    
+    }
 #endif
     if (!temppath.empty()) {
         folder = temppath;
@@ -600,7 +608,7 @@ static std::string cr_version_path(const std::string &basepath,
 }
 
 namespace cr_plugin_section_type {
-enum e { state, bss, count };
+enum e { state, bss, ptrs, count };
 }
 
 namespace cr_plugin_section_version {
@@ -630,6 +638,7 @@ struct cr_internal {
     cr_plugin_main_func main = nullptr;
     cr_plugin_event_func event_fn = nullptr;
     cr_plugin_crash_func crash_fn = nullptr;
+    cr_plugin_reload_func reload_fn = nullptr;
     cr_plugin_segment seg = {};
     cr_plugin_section data[cr_plugin_section_type::count]
                           [cr_plugin_section_version::count] = {};
@@ -644,7 +653,7 @@ static void cr_plugin_sections_reload(cr_plugin &ctx,
                                       cr_plugin_section_version::e version);
 static void cr_plugin_sections_store(cr_plugin &ctx);
 static void cr_plugin_sections_backup(cr_plugin &ctx);
-static void cr_plugin_unload(cr_plugin &ctx, bool rollback, bool close);
+static int cr_plugin_unload(cr_plugin &ctx, bool rollback, bool close);
 static bool cr_plugin_changed(cr_plugin &ctx);
 static bool cr_plugin_rollback(cr_plugin &ctx);
 static int cr_plugin_main(cr_plugin &ctx, cr_op operation);
@@ -721,7 +730,7 @@ static bool cr_copy(const std::string &from, const std::string &to) {
     return CopyFile(_from.c_str(), _to.c_str(), FALSE) ? true : false;
 }
 
-static void cr_del(const std::string& path) {   
+static void cr_del(const std::string& path) {
     CR_WINDOWS_ConvertPath(_path, path);
     DeleteFile(_path.c_str());
 }
@@ -966,6 +975,7 @@ static bool cr_pdb_replace(const std::string &filename, const std::string &pdbna
                 if (len >= strlen(pdbname.c_str())) {
                     orig_pdb = pdb;
                     memcpy_s(pdb, len, pdbname.c_str(), pdbname.length());
+                    pdb[pdbname.length()] = 0;
                     result = true;
                 }
             }
@@ -1003,8 +1013,8 @@ static void cr_pe_section_save(cr_plugin &ctx, cr_plugin_section_type::e type,
     const auto version = cr_plugin_section_version::current;
     auto p = (cr_internal *)ctx.p;
     auto data = &p->data[type][version];
-    const size_t old_size = data->size;
-    data->base = base;
+    const size_t old_size = (size_t)data->size;
+    data->base = (intptr_t)base;
     data->ptr = (char *)vaddr;
     data->size = shdr.SizeOfRawData;
     data->data = CR_REALLOC(data->data, shdr.SizeOfRawData);
@@ -1054,7 +1064,19 @@ static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
                                    base + sectionHeader.VirtualAddress, base,
                                    sectionHeader);
             }
-        }
+        } else if (!strcmp((const char*)sectionHeader.Name, ".ptrs")) {
+            if (ctx.version || rollback) {
+                result &= cr_plugin_section_validate(
+                    ctx, cr_plugin_section_type::ptrs,
+                    base + sectionHeader.VirtualAddress, base, size);
+            }
+            if (result) {
+                auto sec = cr_plugin_section_type::ptrs;
+                cr_pe_section_save(ctx, sec,
+                                   base + sectionHeader.VirtualAddress, base,
+                                   sectionHeader);
+            }
+        } 
     }
     return result;
 }
@@ -1305,6 +1327,16 @@ bool cr_elf_validate_sections(cr_plugin &ctx, bool rollback, H shdr, int shnum,
             if (result) {
                 cr_elf_section_save(ctx, sec, vaddr, addr, sectionHeader);
             }
+        } else if (!strcmp(name, ".ptrs")) {
+            const int64_t vaddr = base - size;
+            auto sec = cr_plugin_section_type::ptrs;
+            if (ctx.version || rollback) {
+                result &=
+                    cr_plugin_section_validate(ctx, sec, vaddr, addr, size);
+            }
+            if (result) {
+                cr_elf_section_save(ctx, sec, vaddr, addr, sectionHeader);
+            }
         } else if (!strcmp(name, ".bss")) {
             // .bss goes past segment filesz, but it may be just padding
             const int64_t vaddr = base;
@@ -1349,6 +1381,7 @@ struct cr_ld_data {
 // https://eli.thegreenplace.net/2011/08/25/load-time-relocation-of-shared-libraries/
 static int cr_dl_header_handler(struct dl_phdr_info *info, size_t size,
                                 void *data) {
+    (void)(size);
     CR_ASSERT(info && data);
     auto p = (cr_ld_data *)data;
     auto ctx = p->ctx;
@@ -1412,12 +1445,12 @@ static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
             result = cr_elf_validate_sections(ctx, rollback, shdr,
                                               ehdr->e_shnum, sh_strtab_p);
         } else {
-            auto ehdr = (Elf64_Ehdr *)p; // shadow
-            auto shdr = (Elf64_Shdr *)(p + ehdr->e_shoff);
-            auto sh_strtab = &shdr[ehdr->e_shstrndx];
+            auto ehdr64 = (Elf64_Ehdr *)p;
+            auto shdr = (Elf64_Shdr *)(p + ehdr64->e_shoff);
+            auto sh_strtab = &shdr[ehdr64->e_shstrndx];
             const char *const sh_strtab_p = p + sh_strtab->sh_offset;
             result = cr_elf_validate_sections(ctx, rollback, shdr,
-                                              ehdr->e_shnum, sh_strtab_p);
+                                              ehdr64->e_shnum, sh_strtab_p);
         }
     } while (0);
 
@@ -1477,6 +1510,8 @@ void cr_macho_section_save(cr_plugin &ctx, cr_plugin_section_type::e type,
 static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
                                         const std::string &imagefile,
                                         bool rollback) {
+    (void)(handle);
+    
     bool result = true;
     auto pimpl = (cr_internal *)ctx.p;
     if (pimpl->mode == CR_DISABLE) {
@@ -1506,6 +1541,8 @@ static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
             continue;
         }
 
+        intptr_t vaddr = _dyld_get_image_vmaddr_slide(i);
+        auto cmd_stride = sizeof(struct mach_header);
         if (hdr->magic != CR_MH_MAGIC) {
             // check for conforming mach-o header
             continue;
@@ -1530,6 +1567,10 @@ static bool cr_plugin_validate_sections(cr_plugin &ctx, so_handle handle,
         if (result) {
             ptr = (intptr_t)getsectiondata(mhdr, SEG_DATA, "__state", &size);
             validate_and_save(cr_plugin_section_type::state, ptr, (size_t)size);
+        }
+        if (result) {
+            ptr = (intptr_t)getsectiondata(mhdr, SEG_DATA, "__ptrs", &size);
+            validate_and_save(cr_plugin_section_type::ptrs, ptr, (size_t)size);
         }
         break;
     }
@@ -1567,7 +1608,7 @@ static void* cr_so_symbol(so_handle handle, const char* name) {
     dlerror();
     auto sym = dlsym(handle, name);
     if (!sym) {
-        CR_ERROR(stderr, "Couldn't find plugin entry point: %s\n", dlerror());
+        CR_ERROR("Couldn't find plugin entry point: %s\n", dlerror());
     }
     return sym;
 }
@@ -1577,6 +1618,7 @@ sigjmp_buf env;
 static void cr_signal_handler(int sig, siginfo_t *si, void *uap) {
     CR_TRACE
     (void)uap;
+    (void)si;
     CR_ASSERT(si);
     siglongjmp(env, sig);
 }
@@ -1661,11 +1703,15 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
     auto p = (cr_internal *)ctx.p;
     const auto file = p->fullname;
     if (cr_exists(file) || rollback) {
-        const auto new_file = cr_version_path(file, ctx.version, p->temppath);
+        const auto old_file = cr_version_path(file, ctx.version, p->temppath);
+        CR_LOG("unload '%s' with rollback: %d\n", old_file.c_str(), rollback);
+        int r = cr_plugin_unload(ctx, rollback, false);
+        if (r < 0) {
+            return false;
+        }
 
-        const bool close = false;
-        CR_LOG("unload '%s' with rollback: %d\n", file.c_str(), rollback);
-        cr_plugin_unload(ctx, rollback, close);
+        auto new_version = ctx.version + (rollback ? 0 : 1);
+        const auto new_file = cr_version_path(file, new_version, p->temppath);
         if (!rollback) {
             cr_copy(file, new_file);
 
@@ -1712,7 +1758,20 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
         }
         p2->event_fn = (cr_plugin_event_func)cr_so_symbol(new_dll, CR_EVENT_FUNC);
 
-        ctx.version++;
+        // run reload callback
+        cr_plugin_section* sec = 
+            &p2->data[cr_plugin_section_type::ptrs][cr_plugin_section_version::current];
+        if (p2->reload_fn && ctx.version && sec->size && 
+            (p2->mode == CR_SAFE || p2->mode == CR_SAFEST)) {
+            CR_ASSERT(sec->ptr);
+            CR_ASSERT(sec->data);
+            int num_ptrs = int(sec->size/sizeof(void*));
+            const void** ptrs = (const void **)sec->data;
+            const void** new_ptrs = (const void**)sec->ptr;
+            p->reload_fn(&ctx, p2->fullname.c_str(), ptrs, new_ptrs, num_ptrs);
+        }        
+
+        ctx.version = new_version;
         CR_LOG("loaded: %s (version: %d)\n", new_file.c_str(), ctx.version);
     } else {
         CR_ERROR("Error loading plugin.\n");
@@ -1754,13 +1813,13 @@ static void cr_plugin_sections_backup(cr_plugin &ctx) {
         auto cur = &p->data[i][cr_plugin_section_version::current];
         if (cur->ptr) {
             auto bkp = &p->data[i][cr_plugin_section_version::backup];
-            bkp->data = CR_REALLOC(bkp->data, cur->size);
+            bkp->data = CR_REALLOC(bkp->data, (size_t)cur->size);
             bkp->ptr = cur->ptr;
             bkp->size = cur->size;
             bkp->base = cur->base;
 
             if (bkp->data) {
-                std::memcpy(bkp->data, cur->data, bkp->size);
+                std::memcpy(bkp->data, cur->data, (size_t)bkp->size);
             }
         }
     }
@@ -1784,7 +1843,7 @@ static void cr_plugin_sections_store(cr_plugin &ctx) {
         if (p->data[i][version].ptr && p->data[i][version].data) {
             const char *ptr = p->data[i][version].ptr;
             const int64_t len = p->data[i][version].size;
-            std::memcpy(p->data[i][version].data, ptr, len);
+            std::memcpy(p->data[i][version].data, ptr, (size_t)len);
         }
     }
 
@@ -1809,10 +1868,12 @@ static void cr_plugin_sections_reload(cr_plugin &ctx,
             // restore backup into the current section address as it may
             // change due aslr and backup address may be invalid
             const auto current = cr_plugin_section_version::current;
-            auto dest = (void *)p->data[i][current].ptr;
-            if (dest) {
-                std::memcpy(dest, p->data[i][version].data, len);
-            }
+            if (i != (int)cr_plugin_section_type::ptrs) {
+                auto dest = (void *)p->data[i][current].ptr;
+                if (dest) {
+                    std::memcpy(dest, p->data[i][version].data, (size_t)len);
+                }
+            } 
         }
     }
 }
@@ -1847,18 +1908,25 @@ static bool cr_plugin_changed(cr_plugin &ctx) {
 // unload is due a rollback, no `cr_op::CR_UNLOAD` is called neither any state
 // is saved, giving opportunity to the previous version to continue with valid
 // previous state.
-static void cr_plugin_unload(cr_plugin &ctx, bool rollback, bool close) {
+static int cr_plugin_unload(cr_plugin &ctx, bool rollback, bool close) {
     CR_TRACE
     auto p = (cr_internal *)ctx.p;
+    int r = 0;
     if (p->handle) {
         if (!rollback) {
-            cr_plugin_main(ctx, close ? CR_CLOSE : CR_UNLOAD);
-            cr_plugin_sections_store(ctx);
+            r = cr_plugin_main(ctx, close ? CR_CLOSE : CR_UNLOAD);
+            // Don't store state if unload crashed.  Rollback will use backup.
+            if (r < 0) {
+                CR_LOG("4 FAILURE: %d\n", r);
+            } else {
+                cr_plugin_sections_store(ctx);
+            }
         }
         cr_so_unload(ctx);
         p->handle = nullptr;
         p->main = nullptr;
     }
+    return r;
 }
 
 // internal
@@ -1867,7 +1935,6 @@ static void cr_plugin_unload(cr_plugin &ctx, bool rollback, bool close) {
 // in turn may also cause more rollbacks.
 static bool cr_plugin_rollback(cr_plugin &ctx) {
     CR_TRACE
-    ctx.version = ctx.version > 0 ? ctx.version - 1 : 0;
     auto loaded = cr_plugin_load_internal(ctx, true);
     if (loaded) {
         loaded = cr_plugin_main(ctx, CR_LOAD) >= 0;
@@ -1889,7 +1956,7 @@ extern "C" int cr_plugin_reload(cr_plugin &ctx) {
         return -1;
     }
 
-    int r = cr_plugin_main(ctx, CR_LOAD);
+    int r = cr_plugin_main(ctx, ctx.version == 1 ? CR_INIT : CR_LOAD);
     if (r < 0 && ctx.failure == CR_NONE) {
         CR_LOG("2 FAILURE: %d\n", r);
         ctx.failure = CR_USER;
@@ -1944,13 +2011,15 @@ extern "C" void* cr_plugin_symbol(cr_plugin& ctx, const char* name)
 
 // Loads a plugin from the specified full path (or current directory if NULL).
 extern "C" bool cr_plugin_load(cr_plugin &ctx, const char *fullpath, 
-                               cr_plugin_crash_func crash_fn = nullptr) {
+                               cr_plugin_crash_func crash_fn = nullptr,
+                               cr_plugin_reload_func reload_fn = nullptr) {
     CR_TRACE                                   
     CR_ASSERT(fullpath);
     auto p = new(CR_MALLOC(sizeof(cr_internal))) cr_internal;
     p->mode = CR_OP_MODE;
     p->fullname = fullpath;
     p->crash_fn = crash_fn;
+    p->reload_fn = reload_fn;
 
     ctx.p = p;
     ctx.version = 0;
